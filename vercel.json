@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/download.py": {
-      "runtime": "python3.11"
+      "runtime": "now-php@1.0.0"
     }
   },
   "routes": [
