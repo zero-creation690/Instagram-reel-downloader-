@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "api/download.py": {
+      "runtime": "python3.11"
+    }
+  },
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/download.py" }
+  ]
+}
