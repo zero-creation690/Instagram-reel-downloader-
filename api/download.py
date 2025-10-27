@@ -1,15 +1,14 @@
-# api/download.py
-from fastapi import FastAPI, Query, Response, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-from bs4 import BeautifulSoup
-from typing import Optional
+from fastapi.responses import RedirectResponse, JSONResponse
+import requests
 import re
 import json
+from typing import Dict, Any
 
-app = FastAPI(title="Instagram Downloader API", version="2.0")
+app = FastAPI()
 
-# ✅ Enable CORS for all (can restrict later)
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,111 +17,178 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0 Safari/537.36"
-)
+class InstagramReelDownloader:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
 
-async def fetch_html(url: str) -> str:
-    """Fetch page HTML from Instagram."""
-    if not url.startswith("http"):
-        url = "https://" + url
-    # Convert to standard post URL for reels or short URLs
-    url = re.sub(r"(reel|tv|stories)", "p", url)
-    async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": USER_AGENT}) as client:
-        r = await client.get(url, follow_redirects=True)
-        r.raise_for_status()
-        return r.text
-
-def extract_media_from_html(html: str) -> Optional[dict]:
-    """Extract image/video URL from public Instagram HTML."""
-    soup = BeautifulSoup(html, "lxml")
-
-    # Try <meta property="og:video">
-    og_video = soup.find("meta", property="og:video")
-    if og_video and og_video.get("content"):
-        return {"url": og_video["content"], "type": "video"}
-
-    # Try <meta property="og:image">
-    og_image = soup.find("meta", property="og:image")
-    if og_image and og_image.get("content"):
-        return {"url": og_image["content"], "type": "image"}
-
-    # Try JSON data inside <script type="application/ld+json">
-    for tag in soup.find_all("script", type="application/ld+json"):
+    def get_reel_info(self, url: str) -> Dict[str, Any]:
+        """Extract reel information from Instagram URL"""
         try:
-            data = json.loads(tag.string)
-            if isinstance(data, dict) and data.get("video"):
-                video = data["video"]
-                if isinstance(video, dict) and video.get("contentUrl"):
-                    return {"url": video["contentUrl"], "type": "video"}
-            elif isinstance(data, dict) and data.get("image"):
-                img = data["image"]
-                if isinstance(img, str):
-                    return {"url": img, "type": "image"}
-        except Exception:
-            continue
+            # Clean the URL
+            url = url.split('?')[0]
+            
+            # Fetch the page content
+            response = self.session.get(url)
+            response.raise_for_status()
+            
+            # Find JSON data in the HTML
+            html_content = response.text
+            
+            # Look for JSON data in script tags
+            json_pattern = r'window\._sharedData\s*=\s*({.+?});'
+            match = re.search(json_pattern, html_content)
+            
+            if match:
+                json_data = json.loads(match.group(1))
+                return self._parse_json_data(json_data)
+            
+            # Alternative pattern for newer Instagram versions
+            alternative_pattern = r'{"config":{"csrf_token":"[^"]+","viewer"[^>]+}'
+            matches = re.findall(alternative_pattern, html_content)
+            
+            for match in matches:
+                try:
+                    json_data = json.loads(match)
+                    return self._parse_json_data(json_data)
+                except:
+                    continue
+            
+            # If no JSON found, try to extract from meta tags
+            return self._extract_from_meta_tags(html_content, url)
+            
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error fetching reel: {str(e)}")
 
-    # Fallback: search for window.__sharedData
-    text = soup.prettify()
-    m = re.search(r'window\._sharedData\s*=\s*({.+?});', text)
-    if m:
+    def _parse_json_data(self, json_data: Dict) -> Dict[str, Any]:
+        """Parse Instagram JSON data to extract reel information"""
         try:
-            jd = json.loads(m.group(1))
-            media = jd.get("entry_data", {}).get("PostPage", [{}])[0].get("graphql", {}).get("shortcode_media")
-            if media:
-                if media.get("is_video"):
-                    return {"url": media.get("video_url"), "type": "video"}
-                else:
-                    return {"url": media.get("display_url"), "type": "image"}
-        except Exception:
-            pass
+            # Navigate through the JSON structure to find the video
+            if 'entry_data' in json_data:
+                posts = json_data['entry_data'].get('PostPage', [])
+                if posts:
+                    media = posts[0].get('graphql', {}).get('shortcode_media', {})
+                    return self._extract_from_media(media)
+            
+            # Alternative path for different JSON structure
+            if 'config' in json_data and 'viewer' in json_data.get('config', {}):
+                # This might be a different structure, try to find video URLs
+                pass
+                
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error parsing data: {str(e)}")
+        
+        raise HTTPException(status_code=404, detail="No reel data found")
 
-    return None
+    def _extract_from_media(self, media: Dict) -> Dict[str, Any]:
+        """Extract information from media object"""
+        is_video = media.get('is_video', False)
+        
+        if not is_video:
+            raise HTTPException(status_code=400, detail="URL is not a video reel")
+        
+        video_url = media.get('video_url')
+        if not video_url:
+            raise HTTPException(status_code=404, detail="Video URL not found")
+        
+        return {
+            'success': True,
+            'type': 'reel',
+            'url': video_url,
+            'thumbnail': media.get('display_url'),
+            'duration': media.get('video_duration'),
+            'dimensions': {
+                'width': media.get('dimensions', {}).get('width'),
+                'height': media.get('dimensions', {}).get('height')
+            },
+            'owner': {
+                'username': media.get('owner', {}).get('username'),
+                'full_name': media.get('owner', {}).get('full_name')
+            },
+            'caption': media.get('edge_media_to_caption', {}).get('edges', [{}])[0].get('node', {}).get('text', ''),
+            'timestamp': media.get('taken_at_timestamp')
+        }
 
+    def _extract_from_meta_tags(self, html: str, original_url: str) -> Dict[str, Any]:
+        """Extract video URL from meta tags as fallback"""
+        try:
+            # Look for video URL in meta tags
+            video_pattern = r'"video_url":"([^"]+)"'
+            video_match = re.search(video_pattern, html)
+            
+            if video_match:
+                video_url = video_match.group(1).replace('\\u0025', '%')
+                return {
+                    'success': True,
+                    'type': 'reel',
+                    'url': video_url,
+                    'thumbnail': None,
+                    'duration': None,
+                    'dimensions': None,
+                    'owner': {'username': 'unknown', 'full_name': 'unknown'},
+                    'caption': '',
+                    'timestamp': None
+                }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not extract video: {str(e)}")
+        
+        raise HTTPException(status_code=404, detail="No video found in the page")
+
+@app.get("/")
+async def root():
+    return {"message": "Instagram Reel Downloader API", "status": "active"}
+
+@app.get("/api/download")
+async def download_reel(url: str = None):
+    """Download Instagram reel - returns direct download URL"""
+    if not url:
+        raise HTTPException(status_code=400, detail="URL parameter is required")
+    
+    if 'instagram.com' not in url:
+        raise HTTPException(status_code=400, detail="Invalid Instagram URL")
+    
+    downloader = InstagramReelDownloader()
+    reel_info = downloader.get_reel_info(url)
+    
+    if reel_info['success']:
+        # Return the direct download URL
+        return JSONResponse({
+            'success': True,
+            'data': reel_info
+        })
+    else:
+        raise HTTPException(status_code=404, detail="Reel not found")
 
 @app.get("/api/info")
-async def info(url: str = Query(..., description="Public Instagram post or reel URL")):
-    """
-    Returns JSON with direct media URL and type (image or video).
-    Works for Posts, Reels, and TV videos.
-    """
-    try:
-        html = await fetch_html(url)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Error fetching URL: {e}")
+async def get_reel_info(url: str = None):
+    """Get reel information without downloading"""
+    if not url:
+        raise HTTPException(status_code=400, detail="URL parameter is required")
+    
+    if 'instagram.com' not in url:
+        raise HTTPException(status_code=400, detail="Invalid Instagram URL")
+    
+    downloader = InstagramReelDownloader()
+    reel_info = downloader.get_reel_info(url)
+    
+    return JSONResponse(reel_info)
 
-    media = extract_media_from_html(html)
-    if not media:
-        raise HTTPException(
-            status_code=404,
-            detail="No media found. This may be a private post or Instagram structure changed."
-        )
-    return {"media_url": media["url"], "type": media["type"], "success": True}
+@app.get("/api/redirect")
+async def redirect_to_download(url: str = None):
+    """Redirect directly to the video file"""
+    if not url:
+        raise HTTPException(status_code=400, detail="URL parameter is required")
+    
+    downloader = InstagramReelDownloader()
+    reel_info = downloader.get_reel_info(url)
+    
+    if reel_info['success']:
+        return RedirectResponse(url=reel_info['url'])
+    else:
+        raise HTTPException(status_code=404, detail="Reel not found")
 
-
-@app.get("/api/fetch")
-async def fetch_media(url: str = Query(..., description="Public Instagram post or reel URL")):
-    """
-    Proxies the media directly (downloads Reels, Posts, or TV videos).
-    """
-    try:
-        html = await fetch_html(url)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Error fetching URL: {e}")
-
-    media = extract_media_from_html(html)
-    if not media:
-        raise HTTPException(status_code=404, detail="No media found (private or broken).")
-
-    media_url = media["url"]
-
-    try:
-        async with httpx.AsyncClient(timeout=60.0, headers={"User-Agent": USER_AGENT}) as client:
-            r = await client.get(media_url, follow_redirects=True)
-            r.raise_for_status()
-            content_type = r.headers.get("Content-Type", "video/mp4" if media["type"] == "video" else "image/jpeg")
-            return Response(content=r.content, media_type=content_type)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Error fetching media: {e}")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
