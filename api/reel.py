@@ -8,7 +8,6 @@ app = FastAPI()
 @app.get("/api/reel")
 def get_reel(url: str = Query(..., description="Instagram Reel URL")):
     try:
-        # Basic validation
         if "instagram.com/reel/" not in url:
             return JSONResponse(
                 {"success": False, "error": "Invalid Instagram reel URL"},
@@ -19,10 +18,10 @@ def get_reel(url: str = Query(..., description="Instagram Reel URL")):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0",
         }
 
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
             return JSONResponse(
-                {"success": False, "error": "Failed to fetch the reel page"},
+                {"success": False, "error": f"Failed to fetch reel: {response.status_code}"},
                 status_code=500,
             )
 
@@ -31,7 +30,7 @@ def get_reel(url: str = Query(..., description="Instagram Reel URL")):
 
         if not meta or not meta.get("content"):
             return JSONResponse(
-                {"success": False, "error": "Video URL not found. Reel might be private or unavailable."},
+                {"success": False, "error": "Reel might be private or not available."},
                 status_code=404,
             )
 
